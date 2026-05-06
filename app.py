@@ -1,55 +1,752 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import re
 import os
+import urllib.request
+import urllib.error
+import urllib.parse
+import json
 
-import streamlit as st
+app = Flask(__name__)
+CORS(app)
 
-from komarc_from_isbn import (
-    DEFAULT_ALADIN_TTB_KEY,
-    build_komarc,
-    build_markdown_output,
-    fetch_book_info_by_isbn,
-    normalize_isbn,
+ALADIN_API_KEY = os.environ.get("ALADIN_API_KEY", "ttbboyeong09010919001")
+ALADIN_API_URL = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
+
+# ─────────────────────────────────────────────
+# 상수
+# ─────────────────────────────────────────────
+ORG_KEYWORDS = [
+    "협회", "학회", "위원회", "연구소", "연구원", "연구회", "센터",
+    "재단", "법인", "기관", "청", "공단", "공사", "협의회", "연합회",
+    "연맹", "조합", "대학교", "대학", "학교", "출판사", "출판부",
+    "association", "institute", "council", "committee", "foundation",
+    "university", "society", "organization", "corp", "inc", "ltd",
+]
+
+ROLE_LABEL = {
+    "옮긴이": "옮긴이", "역자": "옮긴이", "번역": "옮긴이",
+    "그린이": "그린이", "그림": "그린이", "일러스트": "그린이",
+    "사진": "사진", "감수": "감수", "편저": "편저", "편역": "편역",
+    "엮은이": "엮은이", "편집": "엮은이", "해설": "해설",
+}
+
+PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
+PRIMARY_LABEL = {
+    "지은이": "지은이", "저자": "지은이",
+    "글": "지은이", "글쓴이": "지은이", "": "지은이",
+}
+
+# 발음 변환 매핑
+EN_KO_MAP = {
+    "chatgpt": "챗지피티", "gpt": "지피티", "ai": "에이아이",
+    "api": "에이피아이", "ml": "엠엘", "nlp": "엔엘피",
+    "llm": "엘엘엠", "excel": "엑셀", "youtube": "유튜브",
+}
+
+DECIMAL_MAP = {
+    "2.0": "이점영", "3.0": "삼점영", "4.0": "사점영",
+}
+
+SINO = {"0":"영","1":"일","2":"이","3":"삼","4":"사","5":"오","6":"육","7":"칠","8":"팔","9":"구"}
+
+
+# ─────────────────────────────────────────────
+# 기본 헬퍼
+# ─────────────────────────────────────────────
+def is_org(name):
+    return any(kw in name.lower() for kw in ORG_KEYWORDS)
+
+def is_korean(name):
+    return bool(re.search(r"[\uac00-\ud7a3]", name))
+
+def is_western(name):
+    return bool(re.search(r"[A-Za-z]", name)) and not is_korean(name)
+
+def invert_western(name):
+    parts = name.strip().split()
+    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
+
+def invert_korean(name):
+    parts = name.strip().split()
+    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
+
+
+# ─────────────────────────────────────────────
+# 표제 분리 로직 개선 (괄호·전각문자 처리)
+# ─────────────────────────────────────────────
+DELIMS = [" : ", ": ", ":", " - ", " — ", "–", "—", " · ", "·", " | ", "|"]
+
+def compat_normalize(s):
+    if not s:
+        return ""
+    s = s.replace("：", ":").replace("－", "-").replace("‧", "·").replace("／", "/")
+    s = re.sub(r"[\u2000-\u200f\u202a-\u202e]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+TRAIL_PAREN_PAT = re.compile(
+    r"\s*(?:[\(\[](개정|증보|개역|전정|합본|개정판|증보판|신판|보급판|초판|제?\d+\s*판|기념판)[)\]])\s*$",
+    re.IGNORECASE
 )
 
+def strip_trailing_paren_notes(s):
+    return TRAIL_PAREN_PAT.sub("", s).strip(" .,/;:-—·|")
 
-st.set_page_config(page_title="ISBN -> 245/700", page_icon="📚", layout="centered")
-st.title("ISBN -> 24500/7001 자동 생성")
-st.caption(
-    "[알라딘 API](https://blog.aladin.co.kr/openapi/category/29154417)로 조회해 "
-    "KORMARC `245  00`과 `700  1` 필드를 자동 생성합니다."
+def clean_piece(s):
+    if not s:
+        return ""
+    s = compat_normalize(s)
+    s = strip_trailing_paren_notes(s)
+    s = s.strip(" .,/;:-—·|")
+    return s
+
+def find_top_level_split(text, delims=DELIMS):
+    pairs = {
+        "(": ")", "[": "]", "{": "}", "〈": "〉", "《": "》",
+        "「": "」", "『": "』", "\u201c": "\u201d", "\u2018": "\u2019", "«": "»"
+    }
+    opens = set(pairs.keys())
+    stack, i, L = [], 0, len(text)
+    while i < L:
+        ch = text[i]
+        if ch in opens:
+            stack.append(ch)
+            i += 1
+            continue
+        if stack and pairs.get(stack[-1]) == ch:
+            stack.pop()
+            i += 1
+            continue
+        if not stack:
+            for d in delims:
+                if text.startswith(d, i):
+                    return i, d
+        i += 1
+    return None
+
+def split_title_subtitle(raw_title, raw_sub=""):
+    """개선된 표제/부표제 분리"""
+    title = compat_normalize(raw_title)
+    subtitle = clean_piece(raw_sub)
+
+    # API가 부표제를 직접 주는 경우 우선 사용
+    if subtitle:
+        # 제목 끝에 부표제가 붙어있으면 제거
+        for pat in [f" : {subtitle}", f": {subtitle}", f" - {subtitle}"]:
+            if title.endswith(pat):
+                title = title[:-len(pat)]
+                break
+        return clean_piece(title), subtitle
+
+    # 괄호를 고려한 구분자 기반 분리
+    t = compat_normalize(title)
+    hit = find_top_level_split(t, DELIMS)
+    if not hit:
+        return clean_piece(t), ""
+    idx, delim = hit
+    left = t[:idx]
+    right = t[idx + len(delim):]
+    return clean_piece(left), clean_piece(right)
+
+
+# ─────────────────────────────────────────────
+# $n 권차 자동 분리
+# ─────────────────────────────────────────────
+PART_LABEL_RX = re.compile(
+    r"(?:제?\s*\d+\s*(?:권|부|편|책)|[IVXLCDM]+|[상중하]|[전후])$",
+    re.IGNORECASE
 )
 
-isbn_input = st.text_input("ISBN 입력", placeholder="예: 9788998139766")
-run = st.button("24500/7001 생성", type="primary")
+def split_part_number(title, subtitle, item):
+    """제목/부제에서 권차($n) 추출"""
+    a = title.strip()
+    n = ""
 
-st.info(f"현재 기본 TTBKey: `{DEFAULT_ALADIN_TTB_KEY}` (환경변수 `ALADIN_TTB_KEY`로 변경 가능)")
+    # 괄호형 권차: '자바의 정석 (제2권)'
+    m_paren = re.search(r"\s*[\(\[]\s*([^()\[\]]+)\s*[\)\]]\s*$", a)
+    if m_paren and PART_LABEL_RX.search(m_paren.group(1).strip()):
+        n_token = m_paren.group(1).strip()
+        a = a[:m_paren.start()].rstrip(" .,/;:-—·|")
+        m_num = re.search(r"\d+", n_token)
+        return a, subtitle, (m_num.group(0) if m_num else n_token)
 
-if run:
+    # 라벨형: '자바의 정석 제2권'
+    m_label = re.search(r"\s*(제?\s*\d+\s*(?:권|부|편|책))\s*$", a, re.IGNORECASE)
+    if m_label:
+        a = a[:m_label.start()].rstrip(" .,/;:-—·|")
+        m_num = re.search(r"\d+", m_label.group(1))
+        return a, subtitle, (m_num.group(0) if m_num else m_label.group(1).strip())
+
+    # 상/중/하, 전/후
+    m_kor = re.search(r"\s*([상중하]|[전후])\s*$", a)
+    if m_kor:
+        a = a[:m_kor.start()].rstrip(" .,/;:-—·|")
+        return a, subtitle, m_kor.group(1)
+
+    # 로마숫자
+    if not re.fullmatch(r"[IVXLCDM]+", a, re.IGNORECASE):
+        m_roman = re.search(r"\s+([IVXLCDM]{2,})\s*$", a, re.IGNORECASE)
+        if m_roman:
+            a = a[:m_roman.start()].rstrip(" .,/;:-—·|")
+            return a, subtitle, m_roman.group(1)
+
+    return a, subtitle, n
+
+
+# ─────────────────────────────────────────────
+# 246 원제 필드
+# ─────────────────────────────────────────────
+YEAR_EDITION_PAT = re.compile(
+    r"\s*\(\s*(?:\d{3,4}\s*년?|rev(?:ised)?\.?\s*ed\.?|(?:\d+(?:st|nd|rd|th)\s*ed\.?)|edition|ed\.?|제?\s*\d+\s*판|개정(?:증보)?판?|증보판|초판|신판|보급판)[^()\[\]]*\)\s*$",
+    re.IGNORECASE
+)
+
+def build_246(item):
+    """알라딘 originalTitle에서 246 19 $a 생성"""
+    sub_info = item.get("subInfo") or {}
+    orig = (sub_info.get("originalTitle") or "").strip()
+    if not orig:
+        return ""
+    orig = clean_piece(orig)
+    orig = YEAR_EDITION_PAT.sub("", orig).strip()
+    if orig:
+        return "246 19 $a " + orig
+    return ""
+
+
+# ─────────────────────────────────────────────
+# 940 한국어 발음 표기
+# ─────────────────────────────────────────────
+def read_number(num_str):
+    """숫자를 한국어 발음으로 변환"""
+    n = int(num_str)
+    th = n // 1000
+    hu = (n // 100) % 10
+    te = (n // 10) % 10
+    on = n % 10
+    out = []
+    if th:
+        out.append(SINO[str(th)] + "천")
+    if hu:
+        out.append(SINO[str(hu)] + "백")
+    if te:
+        out.append("십" if te == 1 else SINO[str(te)] + "십")
+    if on:
+        out.append(SINO[str(on)])
+    return "".join(out) if out else "영"
+
+def read_digits(num_str):
+    return "".join(SINO.get(ch, ch) for ch in num_str)
+
+def replace_decimals(text):
+    for k, v in DECIMAL_MAP.items():
+        text = text.replace(k, v)
+    return text
+
+def replace_english(text):
+    def sub(m):
+        return EN_KO_MAP.get(m.group(0).lower(), m.group(0))
+    pattern = r"\b(" + "|".join(map(re.escape, EN_KO_MAP.keys())) + r")\b"
+    return re.sub(pattern, sub, text, flags=re.IGNORECASE)
+
+def build_940(title_a):
+    """제목에 숫자/영문이 있으면 한국어 발음 표기 940 필드 생성"""
+    base = (title_a or "").strip()
+    if not base:
+        return []
+    # 숫자/영문 없으면 생략
+    if not re.search(r"[0-9A-Za-z]", base):
+        return []
+
+    variants = set()
+
+    # 영문 치환 + 소수 치환
+    v1 = replace_decimals(base)
+    v1 = replace_english(v1)
+    if v1 != base:
+        variants.add(v1)
+
+    # 숫자 읽기 변형
+    nums = re.findall(r"\d{2,}", base)
+    if nums:
+        work = {replace_decimals(replace_english(base))}
+        for num in nums:
+            new_work = set()
+            candidates = set()
+            candidates.add(read_number(num))
+            candidates.add(read_digits(num))
+            if len(num) == 4 and 1000 <= int(num) <= 2999:
+                candidates.add(read_number(num))
+            for w in work:
+                for c in candidates:
+                    new_work.add(w.replace(num, c, 1))
+            work = new_work
+        variants |= work
+
+    # 940 필드 조립
+    result = []
+    seen = set()
+    for v in sorted(variants, key=len):
+        v = v.strip()
+        if not v or v == base or v in seen:
+            continue
+        if not re.search(r"[가-힣]", v):
+            continue
+        seen.add(v)
+        result.append("940 \\\\ $a " + v)
+
+    return result[:4]
+
+
+# ─────────────────────────────────────────────
+# VIAF 저자 국적 조회
+# ─────────────────────────────────────────────
+# VIAF에서 한국어 관련 nationality 코드
+KOREAN_NATIONALITIES = {
+    "ko",           # 한국어
+    "kor",          # 한국어 ISO 639-2
+}
+
+# VIAF 소스 중 한국국립중앙도서관 코드
+KOREAN_SOURCES = {"NLSK", "NLK"}
+
+def get_viaf_nationality(name):
+    """
+    VIAF API로 저자 국적/언어 정보 조회.
+    반환: 'korean' / 'non_korean' / None(조회 실패)
+
+    VIAF 판별 방식:
+    1. 한국국립중앙도서관(NLK/NLSK) 소스에 등록된 저자 → 한국인
+    2. nationalityOfAssociatedName 필드에 ko/kor → 한국인
+    3. 그 외 → 외국인
+    """
     try:
-        isbn = normalize_isbn(isbn_input.strip())
-        book = fetch_book_info_by_isbn(
-            isbn=isbn,
-            source="aladin",
-            aladin_ttb_key=os.getenv("ALADIN_TTB_KEY", "").strip() or DEFAULT_ALADIN_TTB_KEY,
-        )
-        komarc_lines = build_komarc(book)
-        result_text = "\n".join(komarc_lines)
-        markdown_text = build_markdown_output(book, komarc_lines)
+        # 1단계: VIAF에서 저자 검색
+        search_url = "https://viaf.org/viaf/search"
+        params = {
+            "query": f'local.personalNames all "{name}"',
+            "maximumRecords": 3,
+            "startRecord": 1,
+            "httpAccept": "application/json",
+        }
+        resp = requests.get(search_url, params=params, timeout=8)
+        data = resp.json()
 
-        st.success("24500/7001 생성 완료")
-        st.code(result_text, language="text")
-        st.download_button(
-            label="결과 다운로드 (.txt)",
-            data=result_text,
-            file_name=f"komarc_{isbn}.txt",
-            mime="text/plain",
+        records = (
+            data.get("searchRetrieveResponse", {})
+                .get("records", {})
+                .get("record", [])
         )
-        st.download_button(
-            label="마크다운 다운로드 (.md)",
-            data=markdown_text,
-            file_name=f"komarc_{isbn}.md",
-            mime="text/markdown",
-        )
-    except Exception as exc:  # noqa: BLE001 - 사용자 입력 도구이므로 예외 메시지 직접 노출
-        st.error(f"생성 실패: {exc}")
+
+        # 단일 레코드면 리스트로 변환
+        if isinstance(records, dict):
+            records = [records]
+
+        if not records:
+            return None
+
+        # 2단계: 첫 번째 결과로 판별
+        record_data = records[0].get("recordData", {})
+        viaf_cluster = record_data.get("VIAFCluster", record_data)
+
+        # 방법 1: 소스 기관 확인 — NLK(국립중앙도서관) 소스면 한국인
+        sources = viaf_cluster.get("sources", {}).get("s", [])
+        if isinstance(sources, str):
+            sources = [sources]
+        for source in sources:
+            source_id = source.get("@id", "") if isinstance(source, dict) else str(source)
+            for ks in KOREAN_SOURCES:
+                if ks in source_id:
+                    return "korean"
+
+        # 방법 2: nationalityOfAssociatedName 필드 확인
+        nat_field = viaf_cluster.get("nationalityOfAssociatedName", {})
+        if isinstance(nat_field, dict):
+            nat_data = nat_field.get("data", [])
+            if isinstance(nat_data, dict):
+                nat_data = [nat_data]
+            for item in nat_data:
+                text = (item.get("text", "") or "").lower()
+                if text in KOREAN_NATIONALITIES:
+                    return "korean"
+
+        # 방법 3: VIAF ID로 상세 정보 조회
+        viaf_id = viaf_cluster.get("viafID") or viaf_cluster.get("@viafID")
+        if viaf_id:
+            detail_url = f"https://viaf.org/viaf/{viaf_id}/viaf.json"
+            resp2 = requests.get(detail_url, timeout=8)
+            detail = resp2.json()
+
+            # 소스 기관 재확인
+            src_list = detail.get("sources", {}).get("s", [])
+            if isinstance(src_list, str):
+                src_list = [src_list]
+            for src in src_list:
+                src_id = src.get("@id", "") if isinstance(src, dict) else str(src)
+                for ks in KOREAN_SOURCES:
+                    if ks in src_id:
+                        return "korean"
+
+            # 국적 코드 재확인
+            nat2 = detail.get("nationalityOfAssociatedName", {})
+            if isinstance(nat2, dict):
+                nd = nat2.get("data", [])
+                if isinstance(nd, dict):
+                    nd = [nd]
+                for item in nd:
+                    text = (item.get("text", "") or "").lower()
+                    if text in KOREAN_NATIONALITIES:
+                        return "korean"
+
+        return "non_korean"
+
+    except Exception:
+        return None
 
 
+def is_korean_author_viaf(name):
+    """
+    VIAF 기반 한국인 저자 여부 판별.
+    조회 실패 시 이름 패턴으로 폴백:
+      - 공백 없는 2~5글자 한국어 → 한국인으로 간주
+    """
+    result = get_viaf_nationality(name)
+
+    if result == "korean":
+        return True
+    if result == "non_korean":
+        return False
+
+    # VIAF 조회 실패 시 이름 패턴으로 폴백
+    # 공백 없는 순수 한국어 2~5글자 → 한국인 (김영아, 한강, 박찬욱 등)
+    if re.fullmatch(r"[가-힣]{2,5}", name.strip()):
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────
+# 알라딘 페이지 크롤링 (원어명 추출)
+# ─────────────────────────────────────────────
+def extract_original_names_from_aladin_page(link, names):
+    if not link or not names:
+        return {}
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+
+    result = {}
+    target_names = [n for n in names if not is_org(n)]
+
+    try:
+        req = urllib.request.Request(link, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        for name in target_names:
+            pattern = re.compile(
+                rf"{re.escape(name)}\s*\(\s*([A-Za-z][A-Za-z .,'-]+)\s*\)",
+                re.IGNORECASE
+            )
+            match = pattern.search(html)
+            if match:
+                result[name] = match.group(1).strip()
+
+        if len(result) < len(target_names):
+            author_search_values = re.findall(
+                r"AuthorSearch=([^\"'&\s]+)", html, flags=re.IGNORECASE
+            )
+            author_search_values = list(dict.fromkeys(author_search_values))
+
+            for value in author_search_values:
+                author_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={value}"
+                try:
+                    req2 = urllib.request.Request(author_url, headers=headers)
+                    with urllib.request.urlopen(req2, timeout=12) as resp2:
+                        author_html = resp2.read().decode("utf-8", errors="ignore")
+
+                    pairs = re.findall(
+                        r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
+                        author_html
+                    )
+                    for kor_name, orig_name in pairs:
+                        kn = kor_name.strip()
+                        on = orig_name.strip()
+                        if kn in target_names and kn not in result:
+                            result[kn] = on
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# 저자 파싱
+# ─────────────────────────────────────────────
+def parse_authors(author_str, page_link=""):
+    result = []
+    found = set()
+
+    # 케이스 1: 한국어이름 (영문원어명) (역할)
+    p1 = re.findall(
+        r"([^,]+?)\s*\(([A-Za-z][^)]*)\)\s*\(([^)]+)\)",
+        author_str
+    )
+    for kor_name, original, role in p1:
+        kor_name = kor_name.strip()
+        if not is_korean(kor_name):
+            continue
+        result.append({
+            "name": kor_name,
+            "role": role.strip(),
+            "is_org": is_org(kor_name),
+            "original_name": original.strip(),
+        })
+        found.add(kor_name)
+
+    # 케이스 2: 이름 (역할)
+    p2 = re.findall(r"([^,(]+?)\s*\(([^)]+)\)", author_str)
+    for name, info in p2:
+        name = name.strip()
+        if not name or is_western(name) or name in found:
+            continue
+        result.append({
+            "name": name,
+            "role": info.strip(),
+            "is_org": is_org(name),
+            "original_name": "",
+        })
+        found.add(name)
+
+    if not result:
+        for name in author_str.split(","):
+            name = name.strip()
+            if name:
+                result.append({
+                    "name": name, "role": "", "is_org": is_org(name), "original_name": "",
+                })
+
+    # 페이지 크롤링으로 원어명 보강
+    if page_link:
+        need_original = [
+            a["name"] for a in result
+            if not a["original_name"] and not a["is_org"] and is_korean(a["name"])
+        ]
+        if need_original:
+            scraped = extract_original_names_from_aladin_page(page_link, need_original)
+            for a in result:
+                if a["name"] in scraped:
+                    a["original_name"] = scraped[a["name"]]
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# MARC 필드 생성
+# ─────────────────────────────────────────────
+def build_245(title, subtitle, part_number, authors):
+    a_part = title.strip()
+    b_part = subtitle.strip() if subtitle else ""
+
+    persons = [a for a in authors if not a["is_org"]]
+    primary = [a for a in persons if a["role"] in PRIMARY_ROLES]
+    secondary = [a for a in persons if a["role"] not in PRIMARY_ROLES]
+
+    role_groups = {}
+    for a in secondary:
+        label = ROLE_LABEL.get(a["role"], a["role"])
+        role_groups.setdefault(label, []).append(a)
+
+    field = "$a " + a_part
+
+    # $n 권차
+    if part_number:
+        field += " $n " + part_number
+
+    if b_part:
+        field += " $b : " + b_part
+
+    if primary:
+        p_label = PRIMARY_LABEL.get(primary[0]["role"], "지은이")
+        field += " /$d " + p_label + ": " + primary[0]["name"]
+        for a in primary[1:]:
+            pl = PRIMARY_LABEL.get(a["role"], "지은이")
+            field += " ,$e " + pl + ": " + a["name"]
+        for label, members in role_groups.items():
+            for a in members:
+                field += " ;$e " + label + ": " + a["name"]
+    elif role_groups:
+        all_members = []
+        for members in role_groups.values():
+            all_members.extend(members)
+        first_lbl = ROLE_LABEL.get(all_members[0]["role"], all_members[0]["role"])
+        field += " /$d " + first_lbl + ": " + all_members[0]["name"]
+        for a in all_members[1:]:
+            lbl = ROLE_LABEL.get(a["role"], a["role"])
+            field += " ,$e " + lbl + ": " + a["name"]
+
+    return field
+
+
+def build_700(author):
+    """
+    원어명 있음  → 원어명 역순:                  Nunez, Sigrid
+    원어명 없음 + 한국어 2어절 이상:
+      - VIAF로 한국인 확인 → 그대로:             (해당 없음 — 한국인은 보통 단일 이름)
+      - VIAF로 외국인 확인 → 역순:               레빙턴, 리베카 가딘
+      - VIAF 조회 실패 → 이름 패턴으로 폴백
+    한국어 단일 이름 (2~5글자 공백없음) → 그대로: 김영아
+    """
+    name = author["name"].strip()
+    original = author.get("original_name", "").strip()
+
+    # 원어명 있으면 원어명 역순
+    if original and is_western(original):
+        return "$a " + invert_western(original)
+
+    # 한국어 단일 이름 (공백 없는 2~5글자) → 한국인, 그대로
+    if re.fullmatch(r"[가-힣]{2,5}", name):
+        return "$a " + name
+
+    # 한국어 2어절 이상 → VIAF로 한국인 여부 판별
+    if is_korean(name) and len(name.split()) >= 2:
+        korean = is_korean_author_viaf(name)
+        if korean:
+            return "$a " + name       # 한국인 → 그대로
+        else:
+            return "$a " + invert_korean(name)  # 외국인 한국어 표기 → 역순
+
+    return "$a " + name
+
+
+def build_900(author):
+    """원어명 있는 저자만 → 한국어 역순"""
+    name = author["name"].strip()
+    original = author.get("original_name", "").strip()
+    if original and is_western(original) and is_korean(name):
+        return "900 10 $a " + invert_korean(name)
+    return ""
+
+
+def build_710(author):
+    return "710 0_ $a " + author["name"].strip() + "."
+
+
+def to_isbn13(isbn):
+    if len(isbn) == 13:
+        return isbn
+    base = "978" + isbn[:9]
+    check = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(base))
+    return base + str((10 - check % 10) % 10)
+
+
+def fetch_aladin(isbn):
+    params = {
+        "ttbkey": ALADIN_API_KEY,
+        "itemIdType": "ISBN13",
+        "ItemId": isbn,
+        "output": "js",
+        "Version": "20131101",
+        "OptResult": "authors,subInfo",
+    }
+    resp = requests.get(ALADIN_API_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("item"):
+        raise ValueError("도서를 찾을 수 없습니다.")
+    return data["item"][0]
+
+
+# ─────────────────────────────────────────────
+# API 엔드포인트
+# ─────────────────────────────────────────────
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/isbn", methods=["GET"])
+def isbn_lookup():
+    isbn = request.args.get("isbn", "").replace("-", "").strip()
+    if not isbn:
+        return jsonify({"error": "ISBN을 입력해 주세요."}), 400
+    if not re.fullmatch(r"\d{10}|\d{13}", isbn):
+        return jsonify({"error": "올바른 ISBN-10 또는 ISBN-13 형식이 아닙니다."}), 400
+
+    isbn13 = to_isbn13(isbn)
+
+    try:
+        item = fetch_aladin(isbn13)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": "알라딘 API 오류: " + str(e)}), 502
+
+    # 개선된 표제/부표제 분리
+    raw_title = item.get("title", "")
+    raw_sub = (item.get("subInfo") or {}).get("subTitle") or ""
+    title, subtitle = split_title_subtitle(raw_title, raw_sub)
+
+    # $n 권차 분리
+    title, subtitle, part_number = split_part_number(title, subtitle, item)
+
+    # 저자 파싱
+    author_str = item.get("author", "")
+    page_link = item.get("link", "")
+    authors = parse_authors(author_str, page_link)
+
+    # 245 필드
+    field_245 = build_245(title, subtitle, part_number, authors)
+
+    # 246 원제 필드
+    field_246 = build_246(item)
+
+    # 700 / 900 / 710 필드
+    persons = [a for a in authors if not a["is_org"]]
+    fields_700 = ["700 1_ " + build_700(a) for a in persons]
+
+    fields_900 = []
+    for a in persons:
+        r = build_900(a)
+        if r:
+            fields_900.append(r)
+
+    orgs = [a for a in authors if a["is_org"]]
+    fields_710 = ["710 0_ " + build_710(a) for a in orgs]
+
+    # 940 한국어 발음 표기
+    fields_940 = build_940(title)
+
+    return jsonify({
+        "isbn13": isbn13,
+        "title": title,
+        "subtitle": subtitle,
+        "part_number": part_number,
+        "author_raw": author_str,
+        "authors": authors,
+        "publisher": item.get("publisher", ""),
+        "pub_date": item.get("pubDate", ""),
+        "cover": item.get("cover", ""),
+        "marc": {
+            "f245": "245 00 " + field_245,
+            "f246": field_246,
+            "f700": fields_700,
+            "f710": fields_710,
+            "f900": fields_900,
+            "f940": fields_940,
+        }
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
